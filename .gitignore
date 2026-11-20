@@ -1,0 +1,16 @@
+# Build artifacts
+obj/
+*.obj
+*.o
+*.exe
+*.pdb
+*.ilk
+*.exp
+*.lib
+
+# IDE & local state
+.vs/
+.vscode/
+local/
+*.user
+*.suo

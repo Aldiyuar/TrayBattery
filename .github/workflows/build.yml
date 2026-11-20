@@ -1,0 +1,26 @@
+name: Build TrayBattery
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build with build.ps1
+        shell: pwsh
+        run: .\build.ps1
+
+      - name: Upload TrayBattery.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: TrayBattery-win64
+          path: TrayBattery.exe
+          if-no-files-found: error
