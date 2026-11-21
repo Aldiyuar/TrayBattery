@@ -70,7 +70,7 @@ $outExe = Join-Path $root "TrayBattery.exe"
 Write-Host "Linking TrayBattery.exe..."
 & $lld /SUBSYSTEM:WINDOWS /ENTRY:wWinMainCRTStartup `
     /LIBPATH:"$lib\ucrt\x64" /LIBPATH:"$lib\um\x64" `
-    ucrt.lib kernel32.lib user32.lib gdi32.lib gdiplus.lib d2d1.lib dwrite.lib msimg32.lib shell32.lib advapi32.lib `
+    ucrt.lib kernel32.lib user32.lib gdi32.lib gdiplus.lib d2d1.lib dwrite.lib dwmapi.lib msimg32.lib shell32.lib advapi32.lib `
     setupapi.lib hid.lib cfgmgr32.lib bthprops.lib bluetoothapis.lib `
     /OUT:$outExe @objs
 if ($LASTEXITCODE -ne 0) { throw "Linking failed" }

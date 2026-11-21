@@ -5,6 +5,7 @@
 #include <dwrite.h>
 #include <commctrl.h>
 #include <shellapi.h>
+#include <dwmapi.h>
 
 using namespace Gdiplus;
 using namespace Gdiplus::DllExports;
@@ -29,6 +30,8 @@ static bool g_lightTheme = false;
 static int g_bandWidth = 0;
 static int g_bandHeight = 40;
 static HWND g_ownerTray = nullptr;
+static HWND g_lastNotifyHwnd = nullptr;
+static DWORD g_trayPid = 0;
 static HWND g_lastRebarHwnd = nullptr;
 static int g_lastRebarShrink = 0;
 static int g_lastPosX = -1;
@@ -36,9 +39,14 @@ static int g_lastPosY = -1;
 static int g_lastPosW = -1;
 static int g_lastPosH = -1;
 static bool g_bandVisible = false;
+static bool g_syncing = false;
+static bool g_syncPosted = false;
+static HWINEVENTHOOK g_hookFg = nullptr;
+static HWINEVENTHOOK g_hookTray = nullptr;
 
 static constexpr UINT_PTR BAND_SYNC_TIMER_ID = 77;
-static constexpr UINT BAND_SYNC_MS = 400;
+static constexpr UINT BAND_SYNC_MS = 150;
+static constexpr UINT WM_APP_SYNC_POS = WM_APP + 201;
 
 static void EnsureDirectWrite() {
     if (!g_d2dFactory) {
@@ -470,27 +478,214 @@ static void RestoreRebarWidth() {
     g_lastRebarShrink = 0;
 }
 
+static void HideBandWindow() {
+    if (g_tipWnd) {
+        SendMessageW(g_tipWnd, TTM_ACTIVATE, FALSE, 0);
+    }
+    g_hoverIdx = -1;
+    g_trackingMouse = false;
+    if (g_bandWnd && (g_bandVisible || IsWindowVisible(g_bandWnd))) {
+        ShowWindow(g_bandWnd, SW_HIDE);
+        g_bandVisible = false;
+    }
+}
+
+static bool IsOwnProcessWindow(HWND w, DWORD selfPid) {
+    if (!w) return false;
+    if (w == g_bandWnd || w == g_tipWnd) return true;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(w, &pid);
+    return pid == selfPid;
+}
+
+static bool ShouldIgnoreOverlayClass(HWND w) {
+    wchar_t cls[64] = {};
+    if (!GetClassNameW(w, cls, ARRAYSIZE(cls))) return false;
+    // Allow popup menus and tooltips above the taskbar to render on top without hiding the band
+    return (wcscmp(cls, L"#32768") == 0 ||
+            wcscmp(cls, L"tooltips_class32") == 0 ||
+            wcscmp(cls, L"SysShadow") == 0);
+}
+
+static bool IsTaskbarVisibleOnMonitor(HWND hTray, HWND hNotify, const MONITORINFO& mi, const RECT& rcTray, const RECT& rcNotify) {
+    if (!IsWindowVisible(hTray) || IsIconic(hTray)) return false;
+    if (!IsWindowVisible(hNotify)) return false;
+
+    int trayW = rcTray.right - rcTray.left;
+    int trayH = rcTray.bottom - rcTray.top;
+    if (trayW <= 0 || trayH <= 0) return false;
+
+    RECT visTray = {};
+    if (!IntersectRect(&visTray, &rcTray, &mi.rcMonitor)) return false;
+    int visW = visTray.right - visTray.left;
+    int visH = visTray.bottom - visTray.top;
+
+    // When auto-hide slides the taskbar away, only ~2px stays inside the monitor
+    if (visW < 16 || visH < 16) return false;
+
+    APPBARDATA abd = {};
+    abd.cbSize = sizeof(abd);
+    UINT abState = static_cast<UINT>(SHAppBarMessage(ABM_GETSTATE, &abd));
+    if (abState & ABS_AUTOHIDE) {
+        bool horizontal = (trayW >= trayH);
+        if (horizontal && visH < trayH - 2) return false;
+        if (!horizontal && visW < trayW - 2) return false;
+    }
+
+    RECT visNotify = {};
+    if (!IntersectRect(&visNotify, &rcNotify, &mi.rcMonitor)) return false;
+    if ((visNotify.right - visNotify.left) < 12 || (visNotify.bottom - visNotify.top) < 12) return false;
+
+    return true;
+}
+
+static bool IsBandOccludedAboveTray(HWND hTray, const MONITORINFO& mi, const RECT& rcBand) {
+    DWORD selfPid = GetCurrentProcessId();
+    int monW = mi.rcMonitor.right - mi.rcMonitor.left;
+    int monH = mi.rcMonitor.bottom - mi.rcMonitor.top;
+    int bandW = rcBand.right - rcBand.left;
+    int bandH = rcBand.bottom - rcBand.top;
+    int bandArea = (bandW > 0 && bandH > 0) ? (bandW * bandH) : 0;
+
+    bool reachedTray = false;
+    for (HWND w = GetTopWindow(nullptr); w != nullptr; w = GetWindow(w, GW_HWNDNEXT)) {
+        if (w == hTray) {
+            reachedTray = true;
+            break;
+        }
+        if (IsOwnProcessWindow(w, selfPid)) continue;
+        if (!IsWindowVisible(w) || IsIconic(w)) continue;
+        if (ShouldIgnoreOverlayClass(w)) continue;
+
+        DWORD cloaked = 0;
+        if (SUCCEEDED(DwmGetWindowAttribute(w, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && cloaked != 0) {
+            continue;
+        }
+
+        LONG_PTR ex = GetWindowLongPtrW(w, GWL_EXSTYLE);
+        if ((ex & WS_EX_LAYERED) && (ex & WS_EX_TRANSPARENT)) {
+            continue;
+        }
+        if (ex & WS_EX_LAYERED) {
+            BYTE alpha = 255;
+            DWORD lwaFlags = 0;
+            if (GetLayeredWindowAttributes(w, nullptr, &alpha, &lwaFlags) && (lwaFlags & LWA_ALPHA) && alpha == 0) {
+                continue;
+            }
+        }
+
+        RECT rw = {};
+        if (FAILED(DwmGetWindowAttribute(w, DWMWA_EXTENDED_FRAME_BOUNDS, &rw, sizeof(rw)))) {
+            if (!GetWindowRect(w, &rw)) continue;
+        }
+        if (rw.right <= rw.left || rw.bottom <= rw.top) continue;
+
+        // Fullscreen window covering hTray's monitor above the taskbar (Discord, browser, game, etc.)
+        RECT monCover = {};
+        if (IntersectRect(&monCover, &rw, &mi.rcMonitor)) {
+            if ((monCover.right - monCover.left) >= monW - 16 &&
+                (monCover.bottom - monCover.top) >= monH - 16) {
+                return true;
+            }
+        }
+
+        // Window sitting above hTray that directly covers the battery indicator region
+        RECT bandCover = {};
+        if (bandArea > 0 && IntersectRect(&bandCover, &rw, &rcBand)) {
+            int cw = bandCover.right - bandCover.left;
+            int ch = bandCover.bottom - bandCover.top;
+            if (cw * ch >= (bandArea * 90) / 100) {
+                return true;
+            }
+        }
+    }
+
+    return !reachedTray;
+}
+
+static HWND FindWindowImmediatelyAbove(HWND hTarget, DWORD selfPid) {
+    for (HWND p = GetWindow(hTarget, GW_HWNDPREV); p != nullptr; p = GetWindow(p, GW_HWNDPREV)) {
+        if (!IsOwnProcessWindow(p, selfPid)) return p;
+    }
+    return nullptr;
+}
+
+static bool IsBandDirectlyAboveTray(HWND hTray, DWORD selfPid) {
+    for (HWND p = GetWindow(hTray, GW_HWNDPREV); p != nullptr; p = GetWindow(p, GW_HWNDPREV)) {
+        if (p == g_bandWnd) return true;
+        if (!IsOwnProcessWindow(p, selfPid)) return false;
+    }
+    return false;
+}
+
+static void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject, LONG idChild, DWORD, DWORD) {
+    if (!g_bandWnd || g_syncing || g_syncPosted) return;
+    if (event == EVENT_SYSTEM_FOREGROUND) {
+        g_syncPosted = true;
+        PostMessageW(g_bandWnd, WM_APP_SYNC_POS, 0, 0);
+        return;
+    }
+    if (idObject == OBJID_WINDOW && idChild == CHILDID_SELF &&
+        (hwnd == g_ownerTray || hwnd == g_lastNotifyHwnd)) {
+        g_syncPosted = true;
+        PostMessageW(g_bandWnd, WM_APP_SYNC_POS, 0, 0);
+    }
+}
+
+static void UpdateWinEventHooks(HWND hTray) {
+    if (!g_hookFg) {
+        g_hookFg = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
+                                   nullptr, WinEventProc, 0, 0,
+                                   WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    }
+    DWORD trayPid = 0;
+    if (hTray) GetWindowThreadProcessId(hTray, &trayPid);
+    if (trayPid != g_trayPid) {
+        if (g_hookTray) {
+            UnhookWinEvent(g_hookTray);
+            g_hookTray = nullptr;
+        }
+        g_trayPid = trayPid;
+        if (trayPid != 0) {
+            g_hookTray = SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_LOCATIONCHANGE,
+                                         nullptr, WinEventProc, trayPid, 0,
+                                         WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+        }
+    }
+}
+
+static void UnhookWinEvents() {
+    if (g_hookTray) {
+        UnhookWinEvent(g_hookTray);
+        g_hookTray = nullptr;
+    }
+    if (g_hookFg) {
+        UnhookWinEvent(g_hookFg);
+        g_hookFg = nullptr;
+    }
+    g_trayPid = 0;
+}
+
 void TaskbarBand_SyncPosition() {
-    if (!g_bandWnd || !IsWindow(g_bandWnd)) return;
+    if (!g_bandWnd || !IsWindow(g_bandWnd) || g_syncing) return;
+    g_syncing = true;
 
     if (g_bandCount <= 0) {
-        if (g_bandVisible || IsWindowVisible(g_bandWnd)) {
-            ShowWindow(g_bandWnd, SW_HIDE);
-            g_bandVisible = false;
-        }
+        HideBandWindow();
         RestoreRebarWidth();
+        g_syncing = false;
         return;
     }
 
     HWND hTray = FindWindowW(L"Shell_TrayWnd", nullptr);
     HWND hNotify = hTray ? FindWindowExW(hTray, nullptr, L"TrayNotifyWnd", nullptr) : nullptr;
     HWND hRebar = hTray ? FindWindowExW(hTray, nullptr, L"ReBarWindow32", nullptr) : nullptr;
+    g_lastNotifyHwnd = hNotify;
+    UpdateWinEventHooks(hTray);
 
-    if (!hTray || !hNotify || !IsWindowVisible(hTray)) {
-        if (g_bandVisible || IsWindowVisible(g_bandWnd)) {
-            ShowWindow(g_bandWnd, SW_HIDE);
-            g_bandVisible = false;
-        }
+    if (!hTray || !hNotify) {
+        HideBandWindow();
+        g_syncing = false;
         return;
     }
 
@@ -501,14 +696,25 @@ void TaskbarBand_SyncPosition() {
     }
 
     RECT rcTray = {}, rcNotify = {};
-    if (!GetWindowRect(hTray, &rcTray) || !GetWindowRect(hNotify, &rcNotify)) return;
+    if (!GetWindowRect(hTray, &rcTray) || !GetWindowRect(hNotify, &rcNotify)) {
+        HideBandWindow();
+        g_syncing = false;
+        return;
+    }
+
+    HMONITOR hMon = MonitorFromWindow(hTray, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi = {};
+    mi.cbSize = sizeof(mi);
+    if (!GetMonitorInfoW(hMon, &mi) || !IsTaskbarVisibleOnMonitor(hTray, hNotify, mi, rcTray, rcNotify)) {
+        HideBandWindow();
+        g_syncing = false;
+        return;
+    }
 
     int trayH = rcTray.bottom - rcTray.top;
     if (trayH < 24 || trayH > 120) {
-        if (g_bandVisible || IsWindowVisible(g_bandWnd)) {
-            ShowWindow(g_bandWnd, SW_HIDE);
-            g_bandVisible = false;
-        }
+        HideBandWindow();
+        g_syncing = false;
         return;
     }
 
@@ -519,6 +725,16 @@ void TaskbarBand_SyncPosition() {
     int neededW = ComputeRequiredWidth(g_bandDevs, g_bandCount, g_bandHeight);
     if (neededW != g_bandWidth) sizeChanged = true;
     g_bandWidth = neededW;
+
+    int targetX = rcNotify.left - g_bandWidth - 2;
+    int targetY = rcTray.top;
+    RECT rcBand = { targetX, targetY, targetX + g_bandWidth, targetY + g_bandHeight };
+
+    if (IsBandOccludedAboveTray(hTray, mi, rcBand)) {
+        HideBandWindow();
+        g_syncing = false;
+        return;
+    }
 
     if (hRebar) {
         RECT rcRebar = {};
@@ -534,17 +750,36 @@ void TaskbarBand_SyncPosition() {
         }
     }
 
-    int targetX = rcNotify.left - g_bandWidth - 2;
-    int targetY = rcTray.top;
-
     if (sizeChanged || themeChanged) {
         RenderLayeredBand();
     }
 
-    if (!g_bandVisible || !IsWindowVisible(g_bandWnd) ||
-        targetX != g_lastPosX || targetY != g_lastPosY ||
-        g_bandWidth != g_lastPosW || g_bandHeight != g_lastPosH) {
-        SetWindowPos(g_bandWnd, HWND_TOPMOST, targetX, targetY, g_bandWidth, g_bandHeight,
+    DWORD selfPid = GetCurrentProcessId();
+    bool trayIsTopmost = (GetWindowLongPtrW(hTray, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0;
+    bool bandIsTopmost = (GetWindowLongPtrW(g_bandWnd, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0;
+    bool zOk = (bandIsTopmost == trayIsTopmost) && IsBandDirectlyAboveTray(hTray, selfPid);
+    bool posChanged = (!g_bandVisible || !IsWindowVisible(g_bandWnd) ||
+                       targetX != g_lastPosX || targetY != g_lastPosY ||
+                       g_bandWidth != g_lastPosW || g_bandHeight != g_lastPosH);
+
+    if (posChanged || !zOk) {
+        if (trayIsTopmost && !bandIsTopmost) {
+            SetWindowPos(g_bandWnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        } else if (!trayIsTopmost && bandIsTopmost) {
+            SetWindowPos(g_bandWnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+
+        HWND hAboveTray = FindWindowImmediatelyAbove(hTray, selfPid);
+        HWND zAfter = HWND_TOP;
+        if (hAboveTray == nullptr) {
+            zAfter = trayIsTopmost ? HWND_TOPMOST : HWND_TOP;
+        } else if (!trayIsTopmost && ((GetWindowLongPtrW(hAboveTray, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0)) {
+            zAfter = HWND_TOP;
+        } else {
+            zAfter = hAboveTray;
+        }
+
+        SetWindowPos(g_bandWnd, zAfter, targetX, targetY, g_bandWidth, g_bandHeight,
                      SWP_NOACTIVATE | SWP_SHOWWINDOW);
         g_lastPosX = targetX;
         g_lastPosY = targetY;
@@ -552,6 +787,8 @@ void TaskbarBand_SyncPosition() {
         g_lastPosH = g_bandHeight;
         g_bandVisible = true;
     }
+
+    g_syncing = false;
 }
 
 static int HitTestItem(int x, int y) {
@@ -596,6 +833,11 @@ static LRESULT CALLBACK BandWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             if (wParam == BAND_SYNC_TIMER_ID) {
                 TaskbarBand_SyncPosition();
             }
+            return 0;
+
+        case WM_APP_SYNC_POS:
+            g_syncPosted = false;
+            TaskbarBand_SyncPosition();
             return 0;
 
         case WM_MOUSEMOVE: {
@@ -654,7 +896,7 @@ void TaskbarBand_Init(HINSTANCE hInst, HWND mainWnd) {
     RegisterClassExW(&wc);
 
     g_bandWnd = CreateWindowExW(
-        WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+        WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
         L"TrayBatteryTaskbarBand",
         L"",
         WS_POPUP,
@@ -679,6 +921,7 @@ void TaskbarBand_Init(HINSTANCE hInst, HWND mainWnd) {
             SendMessageW(g_tipWnd, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&ti));
             SendMessageW(g_tipWnd, TTM_SETMAXTIPWIDTH, 0, 320);
         }
+        UpdateWinEventHooks(nullptr);
         SetTimer(g_bandWnd, BAND_SYNC_TIMER_ID, BAND_SYNC_MS, nullptr);
     }
 }
@@ -719,6 +962,7 @@ void TaskbarBand_Update(const DeviceSnapshot* snapshot) {
 }
 
 void TaskbarBand_Shutdown() {
+    UnhookWinEvents();
     RestoreRebarWidth();
     if (g_bandWnd) {
         KillTimer(g_bandWnd, BAND_SYNC_TIMER_ID);
